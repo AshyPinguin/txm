@@ -1,56 +1,63 @@
 use crate::ast::*;
 use crate::error::ParseError;
 use crate::glyph::{RenderCtx, SymbolRegistry};
-use crate::layout::RenderNode;
+use crate::layout_tree::LayoutNode;
 
 pub fn render(
     expr: &Expr,
     reg: &SymbolRegistry,
     ctx: &mut RenderCtx,
-) -> Result<RenderNode, ParseError> {
+) -> Result<LayoutNode, ParseError> {
     match expr {
-        Expr::Ident(s) | Expr::Number(s) => Ok(RenderNode::from_str(s)),
+        Expr::Ident(s) | Expr::Number(s) => {
+            let mut node = LayoutNode::text_str(s);
+            node.style = ctx.current_style;
+            Ok(node)
+        }
 
-        Expr::Group(inner) => render(inner, reg, ctx),
+        Expr::Group(inner) => {
+            let prev_style = ctx.current_style;
+            let res = render(inner, reg, ctx);
+            ctx.current_style = prev_style;
+            res
+        }
 
         Expr::Parens(inner) => {
             let inner = render(inner, reg, ctx)?;
-            Ok(RenderNode::stretchy_delim(&inner, '(', ')', false))
+            Ok(LayoutNode::stretchy_delim(inner, '(', ')', false))
         }
 
         Expr::Brackets(inner) => {
             let inner = render(inner, reg, ctx)?;
-            Ok(RenderNode::stretchy_delim(&inner, '[', ']', false))
+            Ok(LayoutNode::stretchy_delim(inner, '[', ']', false))
+        }
+
+        Expr::Delimiter { left, right, inner } => {
+            let inner = render(inner, reg, ctx)?;
+            Ok(LayoutNode::stretchy_delim(inner, *left, *right, false))
         }
 
         Expr::Neg(inner) => {
             let inner = render(inner, reg, ctx)?;
-            let mut result = RenderNode::new(inner.width + 1, inner.height, inner.baseline);
-            result.data[inner.baseline * result.width] = '-';
-            inner.blit_into(&mut result.data, result.width, 1, 0);
-            Ok(result)
+            Ok(LayoutNode::negate(inner))
         }
 
         Expr::Command { name, opts, args } => {
             if let Some(glyph) = reg.get(name) {
-                let (rendered_opts, rendered_args) = {
-                    ctx.depth += 1;
-                    let rendered = (|| {
-                        Ok((
-                            opts.iter()
-                                .map(|a| render(a, reg, ctx))
-                                .collect::<Result<Vec<_>, _>>()?,
-                            args.iter()
-                                .map(|a| render(a, reg, ctx))
-                                .collect::<Result<Vec<_>, _>>()?,
-                        ))
-                    })();
-                    ctx.depth -= 1;
-                    rendered?
-                };
-                Ok(glyph.render(&rendered_args, &rendered_opts, ctx))
+                let mut eval =
+                    |expr: &Expr, eval_ctx: &mut RenderCtx| -> Result<LayoutNode, ParseError> {
+                        render(expr, reg, eval_ctx)
+                    };
+
+                ctx.depth += 1;
+                let rendered_node = glyph.render_macro(args, opts, ctx, &mut eval);
+                ctx.depth -= 1;
+
+                rendered_node
             } else {
-                Ok(RenderNode::from_str(name))
+                let mut node = LayoutNode::text_str(name);
+                node.style = ctx.current_style;
+                Ok(node)
             }
         }
 
@@ -61,11 +68,7 @@ pub fn render(
             {
                 let base_r = render(base, reg, ctx)?;
                 let sup_r = render(sup, reg, ctx)?;
-                return Ok(RenderNode::limits(
-                    &base_r,
-                    &RenderNode::new(0, 0, 0),
-                    &sup_r,
-                ));
+                return Ok(LayoutNode::limits(base_r, LayoutNode::empty(), sup_r));
             }
 
             let base = render(base, reg, ctx)?;
@@ -79,16 +82,12 @@ pub fn render(
             {
                 let base_r = render(base, reg, ctx)?;
                 let sub_r = render(sub, reg, ctx)?;
-                return Ok(RenderNode::limits(
-                    &base_r,
-                    &sub_r,
-                    &RenderNode::new(0, 0, 0),
-                ));
+                return Ok(LayoutNode::limits(base_r, sub_r, LayoutNode::empty()));
             }
 
             let base = render(base, reg, ctx)?;
             let sub = render(sub, reg, ctx)?;
-            Ok(RenderNode::subscript(&base, &sub))
+            Ok(LayoutNode::subscript(base, sub))
         }
 
         Expr::BothScripts(base, sub, sup) => {
@@ -99,62 +98,59 @@ pub fn render(
                 let base_r = render(base, reg, ctx)?;
                 let sub_r = render(sub, reg, ctx)?;
                 let sup_r = render(sup, reg, ctx)?;
-                return Ok(RenderNode::limits(&base_r, &sub_r, &sup_r));
+                return Ok(LayoutNode::limits(base_r, sub_r, sup_r));
             }
 
             let base_rendered = render(base, reg, ctx)?;
             let sub_rendered = render(sub, reg, ctx)?;
             let sup_rendered = render(sup, reg, ctx)?;
-            Ok(RenderNode::both_scripts(
-                &base_rendered,
-                &sub_rendered,
-                &sup_rendered,
+            Ok(LayoutNode::both_scripts(
+                base_rendered,
+                sub_rendered,
+                sup_rendered,
             ))
         }
 
         Expr::Prime(base, n) => {
             let base = render(base, reg, ctx)?;
-            Ok(RenderNode::prime_suffix(&base, *n))
+            Ok(LayoutNode::prime(base, *n))
         }
 
         Expr::BinOp(lhs, op, rhs) => {
             let lhs = render(lhs, reg, ctx)?;
             let rhs = render(rhs, reg, ctx)?;
-            let op_char = match op {
-                BinOp::Add => '+',
-                BinOp::Sub => '-',
-                BinOp::Eq => '=',
-                BinOp::Mul => '·',
-            };
-            Ok(RenderNode::infix(&lhs, op_char, &rhs))
+            Ok(LayoutNode::infix(lhs, *op, rhs))
         }
 
-        Expr::Escape(s) => Ok(match s.as_str() {
-            " " => RenderNode::new(4, 1, 0),
-            "," => RenderNode::new(1, 1, 0),
-            ":" => RenderNode::new(2, 1, 0),
-            ";" => RenderNode::new(3, 1, 0),
-            "!" => RenderNode::new(0, 1, 0),
-            _ => RenderNode::from_str(s),
-        }),
+        Expr::Escape(s) => {
+            let mut node = match s.as_str() {
+                " " => LayoutNode::text(vec![' '; 4]),
+                "," => LayoutNode::text(vec![',']),
+                ":" => LayoutNode::text(vec![':'; 2]),
+                ";" => LayoutNode::text(vec![';'; 3]),
+                "!" => LayoutNode::empty(),
+                _ => LayoutNode::text_str(s),
+            };
+            node.style = ctx.current_style;
+            Ok(node)
+        }
 
         Expr::Juxtapose(exprs) => {
-            let nodes: Vec<RenderNode> = exprs
+            let nodes: Vec<LayoutNode> = exprs
                 .iter()
                 .map(|e| render(e, reg, ctx))
                 .collect::<Result<_, _>>()?;
-            Ok(RenderNode::hstack(&nodes, 0))
+            Ok(LayoutNode::hstack(&nodes, 0))
         }
 
-        Expr::Empty => Ok(RenderNode::new(0, 0, 0)),
+        Expr::Empty => Ok(LayoutNode::empty()),
 
-        // optimize this?
         Expr::Matrix { name, rows } => {
             if rows.is_empty() {
-                return Ok(RenderNode::new(0, 0, 0));
+                return Ok(LayoutNode::empty());
             }
 
-            let mut rendered_rows: Vec<Vec<RenderNode>> = Vec::new();
+            let mut rendered_rows: Vec<Vec<LayoutNode>> = Vec::new();
 
             let num_cols = rows[0].len();
             for row in rows {
@@ -162,7 +158,7 @@ pub fn render(
                     return Err(ParseError("matrix rows have different lengths".into()));
                 }
 
-                let mut rendered_row: Vec<RenderNode> = Vec::new();
+                let mut rendered_row: Vec<LayoutNode> = Vec::new();
                 for item in row {
                     let rendered_item = render(item, reg, ctx)?;
                     rendered_row.push(rendered_item);
@@ -171,17 +167,17 @@ pub fn render(
                 rendered_rows.push(rendered_row);
             }
 
-            RenderNode::matrix(name, &rendered_rows)
+            LayoutNode::matrix(name, &rendered_rows)
         }
     }
 }
 
 fn render_power(
-    base: RenderNode,
+    base: LayoutNode,
     exp: &Expr,
     reg: &SymbolRegistry,
     ctx: &mut RenderCtx,
-) -> Result<RenderNode, ParseError> {
+) -> Result<LayoutNode, ParseError> {
     if crate::COMPACT_SIMPLE_FRACTIONAL_EXPONENTS
         && let Expr::Command { name, args, .. } = exp
         && name == "frac"
@@ -189,12 +185,12 @@ fn render_power(
         && let (Expr::Number(n), Expr::Number(d)) = (&args[0], &args[1])
     {
         let exp_str = format!("{n}/{d}");
-        let exp_node = RenderNode::from_str(&exp_str);
-        return Ok(RenderNode::superscript(&base, &exp_node));
+        let exp_node = LayoutNode::text_str(&exp_str);
+        return Ok(LayoutNode::superscript(base, exp_node));
     }
 
     let rendered_exp = render(exp, reg, ctx)?;
-    Ok(RenderNode::superscript(&base, &rendered_exp))
+    Ok(LayoutNode::superscript(base, rendered_exp))
 }
 
 #[cfg(test)]
@@ -212,14 +208,20 @@ mod tests {
         let tokens = tokenize(input).unwrap();
         let expr = Parser::new(input, &tokens, &registry).parse_expr().unwrap();
         let node = render(&expr, &registry, &mut RenderCtx::default()).unwrap();
-        let rows: Vec<String> = node
-            .data
-            .chunks(node.width)
-            .map(|row| row.iter().collect())
-            .collect();
-        let index_row = rows.iter().position(|row| row.contains('3')).unwrap();
-        let radicand_row = rows.iter().position(|row| row.contains('8')).unwrap();
 
-        assert!(index_row < radicand_row);
+        // The sqrt node should have an index
+        match &node.kind {
+            crate::layout_tree::NodeKind::Sqrt { index, .. } => {
+                assert!(index.is_some());
+                let index = index.as_ref().unwrap();
+                match &index.kind {
+                    crate::layout_tree::NodeKind::Text { content } => {
+                        assert_eq!(content, &vec!['3']);
+                    }
+                    _ => panic!("expected text node for index"),
+                }
+            }
+            _ => panic!("expected sqrt node"),
+        }
     }
 }

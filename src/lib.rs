@@ -1,8 +1,5 @@
-use crate::glyph::{
-    AbsGlyph, AccentGlyph, AlphabetGlyph, BinomGlyph, FracGlyph, IntegralGlyph, LimitGlyph,
-    RenderCtx, SqrtGlyph, SummationGlyph, SymbolRegistry, TextGlyph, UnicodeGlyph, to_bb, to_bold,
-    to_italic, to_sans, to_upright,
-};
+use crate::backend::Backend;
+use crate::glyph::*;
 use crate::parser::Parser;
 use crate::render::render as render_expr;
 use crate::token::tokenize;
@@ -10,34 +7,40 @@ use crate::token::tokenize;
 use std::sync::OnceLock;
 
 mod ast;
+pub mod backend;
+pub mod backends;
 mod error;
 mod glyph;
-mod layout;
+mod layout_tree;
 mod parser;
 mod render;
+mod style;
 mod token;
 
 pub use error::ParseError;
+pub use layout_tree::{LayoutNode, LineStyle, NodeKind};
+pub use style::Style;
 
 #[cfg(feature = "ratatui")]
 pub mod ratatui;
 
-const UNIFORM_FRACTION_HEIGHT: bool = true;
 const COMPACT_SIMPLE_FRACTIONAL_EXPONENTS: bool = false;
 
-/// Renders a math expression to plain text lines.
-///
-/// On success, the returned string is newline-terminated and contains one line
-/// per rendered row. Returns `ParseError` for lexer, parser, or render errors.
-pub fn render(input: &str) -> Result<String, ParseError> {
+/// Renders a math expression to a `LayoutNode` tree.
+pub fn layout(input: &str) -> Result<LayoutNode, ParseError> {
     let tokens = tokenize(input)?;
     let reg = registry();
     let mut parser = Parser::new(input, &tokens, reg);
     let expr = parser.parse_expr()?;
     let mut ctx = RenderCtx::default();
-    let layout = render_expr(&expr, reg, &mut ctx)?;
+    render_expr(&expr, reg, &mut ctx)
+}
 
-    Ok(layout.to_string())
+/// Renders a math expression to a plain text string with ANSI styling.
+pub fn render(input: &str) -> Result<String, ParseError> {
+    let tree = layout(input)?;
+    let backend = backends::terminal::TerminalBackend::new();
+    Ok(backend.render(&tree).unwrap())
 }
 
 fn registry() -> &'static SymbolRegistry {
@@ -73,6 +76,8 @@ fn build_registry() -> SymbolRegistry {
         ("chi", 'χ'),
         ("psi", 'ψ'),
         ("omega", 'ω'),
+        ("vee", '∨'),
+        ("wedge", '∧'),
     ] {
         r.register(cmd, UnicodeGlyph(ch));
     }
@@ -94,8 +99,8 @@ fn build_registry() -> SymbolRegistry {
 
     for name in &[
         "sin", "cos", "tan", "cot", "sec", "csc", "arcsin", "arccos", "arctan", "sinh", "cosh",
-        "tanh", "log", "ln", "lg", "det", "dim", "hom", "ker", "exp", "deg", "gcd", "lcm", "lim",
-        "sup", "inf", "max", "min", "arg", "Pr", "mod", "adj",
+        "coth", "tanh", "log", "ln", "lg", "det", "dim", "hom", "ker", "exp", "deg", "gcd", "lcm",
+        "lim", "sup", "inf", "max", "min", "arg", "Pr", "mod", "adj",
     ] {
         r.register(*name, TextGlyph(name));
     }
@@ -106,6 +111,9 @@ fn build_registry() -> SymbolRegistry {
     r.register("lim", LimitGlyph);
     r.register("int", IntegralGlyph);
     r.register("sum", SummationGlyph);
+    r.register("prod", ProductGlyph);
+
+    r.register("color", TextColorGlyph);
 
     for (cmd, ch) in [
         ("infty", '∞'),
@@ -154,7 +162,6 @@ fn build_registry() -> SymbolRegistry {
         ("supseteq", '⊇'),
         ("cup", '∪'),
         ("cap", '∩'),
-        ("prod", '∏'),
         ("lvert", '|'),
         ("rvert", '|'),
         ("langle", '⟨'),
@@ -165,11 +172,23 @@ fn build_registry() -> SymbolRegistry {
         ("rceil", '⌉'),
         ("quad", ' '),
         ("dots", '⋯'),
+        ("ldots", '…'),
+        ("vdots", '⋮'),
+        ("ddots", '⋱'),
+        ("aleph", 'ℵ'),
+        ("hbar", 'ℏ'),
+        ("ell", 'ℓ'),
+        ("wp", '℘'),
+        ("oplus", '⊕'),
+        ("ominus", '⊖'),
+        ("otimes", '⊗'),
+        ("oslash", '⊘'),
     ] {
         r.register(cmd, UnicodeGlyph(ch));
     }
 
     r.register("abs", AbsGlyph);
+    r.register("|", AbsGlyph);
 
     for (cmd, map) in [
         ("mathbf", to_bold as fn(char) -> char),
